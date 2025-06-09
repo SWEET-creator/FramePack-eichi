@@ -1,1 +1,10 @@
 webui/submodules
+.venv
+color
+line
+split_videos
+scripts
+outputs
+*.png
+*.mp4
+__pycache__/

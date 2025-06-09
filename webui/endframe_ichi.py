@@ -155,6 +155,13 @@ from diffusers_helper.bucket_tools import find_nearest_bucket
 from eichi_utils.transformer_manager import TransformerManager
 from eichi_utils.text_encoder_manager import TextEncoderManager
 
+import decord
+import imageio_ffmpeg
+import pathlib
+import tempfile
+import shutil
+from tqdm import tqdm
+
 free_mem_gb = get_cuda_free_memory_gb(gpu)
 high_vram = free_mem_gb > 100
 
@@ -307,6 +314,7 @@ os.makedirs(input_dir, exist_ok=True)
 
 # キーフレーム処理関数は keyframe_handler.py に移動済み
 
+# 20250506 pftq: Added function to encode input video frames into latents
 @torch.no_grad()
 def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_index=None, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, alarm_on_completion=False):
     # グローバル変数を使用
@@ -833,7 +841,19 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 traceback.print_exc()
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, translate("Image processing ...")))))
+        
+        # Video encoding
+        if input_video is not None:
+            width, height = get_video_dimensions(input_video)
+            height, width = find_nearest_bucket(height, width, resolution=640)
 
+            stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, 'Video encoding ...'))))
+
+            _, _, video_latents, fps, target_height, target_width, input_video_pixels, video_duration = video_encode(input_video, resolution=640, no_resize=True, vae=vae, vae_batch_size=16, device=gpu, width=width, height=height)
+
+            total_latent_sections = (video_duration * 30) / (latent_window_size * 4)
+            total_latent_sections = int(max(round(total_latent_sections), 1))
+        
         def preprocess_image(img_path_or_array, resolution=640):
             """Pathまたは画像配列を処理して適切なサイズに変換する"""
             if img_path_or_array is None:
@@ -1419,12 +1439,21 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 desc = f"{section_info} " + translate('生成フレーム数: {total_generated_latent_frames}, 動画長: {video_length:.2f} 秒 (FPS-30). 動画が生成中です ...').format(section_info=section_info, total_generated_latent_frames=int(max(0, total_generated_latent_frames * 4 - 3)), video_length=max(0, (total_generated_latent_frames * 4 - 3) / 30))
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
-
+            
+            if input_video is not None:
+                print("[DEBUG] video_latents.shape: ", video_latents.shape)
+                latents = video_latents[:, :, latent_window_size*i_section:latent_window_size*(i_section+1), :, :]
+                print("[DEBUG] latents.shape: ", latents.shape)
+            else:
+                latents = None
+                denoise_strength = 1.0
             generated_latents = sample_hunyuan(
                 transformer=transformer,
                 sampler='unipc',
                 width=width,
                 height=height,
+                latents=latents,
+                denoise_strength=denoise_strength,
                 frames=num_frames,
                 real_guidance_scale=cfg,
                 distilled_guidance_scale=gs,
@@ -3129,6 +3158,8 @@ with block:
 
     with gr.Row():
         with gr.Column():
+            input_video = gr.Video(label="Video", height=320)
+            denoise_strength = gr.Slider(label="Denoise Strength", minimum=0.0, maximum=1.0, value=0.8, step=0.01)
             # Final Frameの上に説明を追加
             gr.Markdown(translate("**Finalは最後の画像、Imageは最初の画像(最終キーフレーム画像といずれか必須)となります。**"))
             end_frame = gr.Image(sources=['upload', 'clipboard'], type="filepath", label=translate("Final Frame (Optional)"), height=320)
@@ -6195,6 +6226,8 @@ with block:
         # process関数のジェネレータを返す - 明示的に全ての引数を渡す
         yield from process(
             input_image=input_image,
+            input_video=input_video,
+            denoise_strength=denoise_strength,
             prompt=prompt,
             n_prompt=n_prompt,
             seed=seed,
@@ -6241,7 +6274,7 @@ with block:
 
     # 実行ボタンのイベント
     # UIから渡されるパラメーターリスト
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf, all_padding_value, end_frame, end_frame_strength, frame_size_radio, keep_section_videos, lora_files, lora_files2, lora_files3, lora_scales_text, output_dir, save_section_frames, section_settings, use_all_padding, use_lora, lora_mode, lora_dropdown1, lora_dropdown2, lora_dropdown3, save_tensor_data, tensor_data_input, fp8_optimization, resolution, batch_count, frame_save_mode, use_vae_cache, use_queue, prompt_queue_file, save_settings_on_start, alarm_on_completion]
+    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf, all_padding_value, end_frame, end_frame_strength, frame_size_radio, keep_section_videos, lora_files, lora_files2, lora_files3, lora_scales_text, output_dir, save_section_frames, section_settings, use_all_padding, use_lora, lora_mode, lora_dropdown1, lora_dropdown2, lora_dropdown3, save_tensor_data, tensor_data_input, fp8_optimization, resolution, batch_count, frame_save_mode, use_vae_cache, use_queue, prompt_queue_file]
     
     start_button.click(fn=validate_and_process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed])
     end_button.click(fn=end_process, outputs=[end_button])

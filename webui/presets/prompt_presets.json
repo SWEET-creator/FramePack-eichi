@@ -1,0 +1,42 @@
+{
+  "presets": [
+    {
+      "name": "デフォルト 1: A character doing so...",
+      "prompt": "A character doing some simple body movements.",
+      "timestamp": "2025-05-14T06:25:11.860068",
+      "is_default": true
+    },
+    {
+      "name": "デフォルト 2: A character uses exp...",
+      "prompt": "A character uses expressive hand gestures and body language.",
+      "timestamp": "2025-05-14T06:25:11.860081",
+      "is_default": true
+    },
+    {
+      "name": "デフォルト 3: A character walks le...",
+      "prompt": "A character walks leisurely with relaxed movements.",
+      "timestamp": "2025-05-14T06:25:11.860085",
+      "is_default": true
+    },
+    {
+      "name": "デフォルト 4: A character performs...",
+      "prompt": "A character performs dynamic movements with energy and flowing motion.",
+      "timestamp": "2025-05-14T06:25:11.860087",
+      "is_default": true
+    },
+    {
+      "name": "デフォルト 5: A character moves in...",
+      "prompt": "A character moves in unexpected ways, with surprising transitions poses.",
+      "timestamp": "2025-05-14T06:25:11.860090",
+      "is_default": true
+    },
+    {
+      "name": "起動時デフォルト",
+      "prompt": "A character doing some simple body movements.",
+      "timestamp": "2025-05-14T06:25:11.860094",
+      "is_default": true,
+      "is_startup_default": true
+    }
+  ],
+  "default_startup_prompt": "A character doing some simple body movements."
+}
