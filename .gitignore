@@ -8,3 +8,6 @@ outputs
 *.png
 *.mp4
 __pycache__/
+*.safetensors
+webui/hf_download/*
+*.log
