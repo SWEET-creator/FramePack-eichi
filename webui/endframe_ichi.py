@@ -1,6 +1,6 @@
 import os
 import sys
-sys.path.append(os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './submodules/FramePack'))))
+sys.path.append(os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), '../../FramePack'))))
 
 # Windows環境で loop再生時に [WinError 10054] の warning が出るのを回避する設定
 import asyncio
@@ -316,7 +316,244 @@ os.makedirs(input_dir, exist_ok=True)
 
 # 20250506 pftq: Added function to encode input video frames into latents
 @torch.no_grad()
-def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_index=None, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, alarm_on_completion=False):
+def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, device="cuda", width=None, height=None):
+    """
+    Encode a video into latent representations using the VAE.
+    
+    Args:
+        video_path: Path to the input video file.
+        vae: AutoencoderKLHunyuanVideo model.
+        height, width: Target resolution for resizing frames.
+        vae_batch_size: Number of frames to process per batch.
+        device: Device for computation (e.g., "cuda").
+    
+    Returns:
+        start_latent: Latent of the first frame (for compatibility with original code).
+        input_image_np: First frame as numpy array (for CLIP vision encoding).
+        history_latents: Latents of all frames (shape: [1, channels, frames, height//8, width//8]).
+        fps: Frames per second of the input video.
+        video_duration: Duration of the video in seconds.
+        target_height: Target height of the video.
+        target_width: Target width of the video.
+        input_video_pixels: Original video frames as tensor.
+    """
+    # 20250506 pftq: Normalize video path for Windows compatibility
+    video_path = str(pathlib.Path(video_path).resolve())
+    print(f"Processing video: {video_path}")
+
+    # 20250506 pftq: Check CUDA availability and fallback to CPU if needed
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA is not available, falling back to CPU")
+        device = "cpu"
+
+    try:
+        # 20250506 pftq: Load video and get FPS
+        print("Initializing VideoReader...")
+        vr = decord.VideoReader(video_path)
+        fps = vr.get_avg_fps()  # Get input video FPS
+        num_real_frames = len(vr)
+        video_duration = num_real_frames / fps  # Calculate video duration in seconds
+        print(f"Video loaded: {num_real_frames} frames, FPS: {fps}, Duration: {video_duration:.2f} seconds")
+
+        # Truncate to nearest latent size (multiple of 4)
+        latent_size_factor = 4
+        num_frames = (num_real_frames // latent_size_factor) * latent_size_factor
+        if num_frames != num_real_frames:
+            print(f"Truncating video from {num_real_frames} to {num_frames} frames for latent size compatibility")
+        num_real_frames = num_frames
+
+        # 20250506 pftq: Read frames
+        print("Reading video frames...")
+        frames = vr.get_batch(range(num_real_frames)).asnumpy()  # Shape: (num_real_frames, height, width, channels)
+        print(f"Frames read: {frames.shape}")
+        
+        # スロー用の繰り返し回数を計算
+        target_frames = 36
+        num_real_frames = frames.shape[0]
+        repeat_factor = target_frames // num_real_frames  # 36÷12 = 3
+
+        # 整数倍で割り切れない場合はエラーにするか、floor/ceil 処理を入れてもOK
+        if target_frames % num_real_frames != 0:
+            raise ValueError(f"target_frames ({target_frames}) must be divisible by num_real_frames ({num_real_frames})")
+
+        # 時間方向に繰り返す
+        frames = np.repeat(frames, repeat_factor, axis=0)
+
+        print(f"After slow-motion: {frames.shape}")
+
+        # 20250506 pftq: Get native video resolution
+        native_height, native_width = frames.shape[1], frames.shape[2]
+        print(f"Native video resolution: {native_width}x{native_height}")
+    
+        # 20250506 pftq: Use native resolution if height/width not specified, otherwise use provided values
+        target_height = native_height if height is None else height
+        target_width = native_width if width is None else width
+    
+        # 20250506 pftq: Adjust to nearest bucket for model compatibility
+        if not no_resize:
+            target_height, target_width = find_nearest_bucket(target_height, target_width, resolution=resolution)
+            print(f"Adjusted resolution: {target_width}x{target_height}")
+        else:
+            print(f"Using native resolution without resizing: {target_width}x{target_height}")
+
+        # 20250506 pftq: Preprocess frames to match original image processing
+        processed_frames = []
+        for i, frame in enumerate(frames):
+            #print(f"Preprocessing frame {i+1}/{num_frames}")
+            frame_np = resize_and_center_crop(frame, target_width=target_width, target_height=target_height)
+            processed_frames.append(frame_np)
+        processed_frames = np.stack(processed_frames)  # Shape: (num_real_frames, height, width, channels)
+        print(f"Frames preprocessed: {processed_frames.shape}")
+
+        # 20250506 pftq: Save first frame for CLIP vision encoding
+        input_image_np = processed_frames[0]
+
+        # 20250506 pftq: Convert to tensor and normalize to [-1, 1]
+        print("Converting frames to tensor...")
+        frames_pt = torch.from_numpy(processed_frames).float() / 127.5 - 1
+        frames_pt = frames_pt.permute(0, 3, 1, 2)  # Shape: (num_real_frames, channels, height, width)
+        frames_pt = frames_pt.unsqueeze(0)  # Shape: (1, num_real_frames, channels, height, width)
+        frames_pt = frames_pt.permute(0, 2, 1, 3, 4)  # Shape: (1, channels, num_real_frames, height, width)
+        print(f"Tensor shape: {frames_pt.shape}")
+        
+        # 20250507 pftq: Save pixel frames for use in worker
+        input_video_pixels = frames_pt.cpu()
+
+        # 20250506 pftq: Move to device
+        print(f"Moving tensor to device: {device}")
+        frames_pt = frames_pt.to(device)
+        print("Tensor moved to device")
+
+        # 20250506 pftq: Move VAE to device
+        print(f"Moving VAE to device: {device}")
+        vae.to(device)
+        print("VAE moved to device")
+
+        # 20250506 pftq: Encode frames in batches
+        print(f"Encoding input video frames in VAE batch size {vae_batch_size} (reduce if memory issues here or if forcing video resolution)")
+        latents = []
+        vae.eval()
+        with torch.no_grad():
+            for i in tqdm(range(0, frames_pt.shape[2], vae_batch_size), desc="Encoding video frames", mininterval=0.1):
+                #print(f"Encoding batch {i//vae_batch_size + 1}: frames {i} to {min(i + vae_batch_size, frames_pt.shape[2])}")
+                batch = frames_pt[:, :, i:i + vae_batch_size]  # Shape: (1, channels, batch_size, height, width)
+                try:
+                    # 20250506 pftq: Log GPU memory before encoding
+                    if device == "cuda":
+                        free_mem = torch.cuda.memory_allocated() / 1024**3
+                        #print(f"GPU memory before encoding: {free_mem:.2f} GB")
+                    batch_latent = vae_encode(batch, vae)
+                    # 20250506 pftq: Synchronize CUDA to catch issues
+                    if device == "cuda":
+                        torch.cuda.synchronize()
+                        #print(f"GPU memory after encoding: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+                    latents.append(batch_latent)
+                    #print(f"Batch encoded, latent shape: {batch_latent.shape}")
+                except RuntimeError as e:
+                    print(f"Error during VAE encoding: {str(e)}")
+                    if device == "cuda" and "out of memory" in str(e).lower():
+                        print("CUDA out of memory, try reducing vae_batch_size or using CPU")
+                    raise
+        
+        # 20250506 pftq: Concatenate latents
+        print("Concatenating latents...")
+        history_latents = torch.cat(latents, dim=2)  # Shape: (1, channels, frames, height//8, width//8)
+        print(f"History latents shape: {history_latents.shape}")
+
+        # 20250506 pftq: Get first frame's latent
+        start_latent = history_latents[:, :, :1]  # Shape: (1, channels, 1, height//8, width//8)
+        print(f"Start latent shape: {start_latent.shape}")
+
+        # 20250506 pftq: Move VAE back to CPU to free GPU memory
+        if device == "cuda":
+            vae.to(cpu)
+            torch.cuda.empty_cache()
+            print("VAE moved back to CPU, CUDA cache cleared")
+
+        return start_latent, input_image_np, history_latents, fps, target_height, target_width, input_video_pixels, video_duration
+
+    except Exception as e:
+        print(f"Error in video_encode: {str(e)}")
+        raise
+
+# 20250508 pftq: for saving prompt to mp4 metadata comments
+def set_mp4_comments_imageio_ffmpeg(input_file, comments):
+    try:
+        # Get the path to the bundled FFmpeg binary from imageio-ffmpeg
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        # Check if input file exists
+        if not os.path.exists(input_file):
+            print(f"Error: Input file {input_file} does not exist")
+            return False
+            
+        # Create a temporary file path
+        temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        
+        # FFmpeg command using the bundled binary
+        command = [
+            ffmpeg_path,                   # Use imageio-ffmpeg's FFmpeg
+            '-i', input_file,              # input file
+            '-metadata', f'comment={comments}',  # set comment metadata
+            '-c:v', 'copy',                # copy video stream without re-encoding
+            '-c:a', 'copy',                # copy audio stream without re-encoding
+            '-y',                          # overwrite output file if it exists
+            temp_file                      # temporary output file
+        ]
+        
+        # Run the FFmpeg command
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode == 0:
+            # Replace the original file with the modified one
+            shutil.move(temp_file, input_file)
+            print(f"Successfully added comments to {input_file}")
+            return True
+        else:
+            # Clean up temp file if FFmpeg fails
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+            print(f"Error: FFmpeg failed with message:\n{result.stderr}")
+            return False
+            
+    except Exception as e:
+        # Clean up temp file in case of other errors
+        if 'temp_file' in locals() and os.path.exists(temp_file):
+            os.remove(temp_file)
+        print(f"Error saving prompt to video metadata, ffmpeg may be required: "+str(e))
+        return False
+
+def get_video_dimensions(video_path):
+    """
+    動画の縦横サイズを取得する関数
+    
+    Args:
+        video_path: 動画ファイルのパス
+        
+    Returns:
+        tuple: (width, height) の形式で動画のサイズを返す
+    """
+    try:
+        # 動画パスを正規化
+        video_path = str(pathlib.Path(video_path).resolve())
+        
+        # VideoReaderを初期化
+        vr = decord.VideoReader(video_path)
+        
+        # 最初のフレームを取得してサイズを確認
+        first_frame = vr.get_batch([0]).asnumpy()
+        height, width = first_frame.shape[1], first_frame.shape[2]
+        
+        return width, height
+        
+    except Exception as e:
+        print(f"動画サイズの取得中にエラーが発生しました: {str(e)}")
+        return None, None
+
+
+# 20250506 pftq: Added function to encode input video frames into latents
+@torch.no_grad()
+def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_index=None, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, alarm_on_completion=False):
     # グローバル変数を使用
     global vae_cache_enabled, current_prompt
     # パラメータ経由の値とグローバル変数の値を確認
@@ -842,8 +1079,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
         stream.output_queue.push(('progress', (None, '', make_progress_bar_html(0, translate("Image processing ...")))))
         
-        # Video encoding
         if input_video is not None:
+            # Video encoding
             width, height = get_video_dimensions(input_video)
             height, width = find_nearest_bucket(height, width, resolution=640)
 
@@ -853,6 +1090,8 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
 
             total_latent_sections = (video_duration * 30) / (latent_window_size * 4)
             total_latent_sections = int(max(round(total_latent_sections), 1))
+        else:
+            video_latents = None
         
         def preprocess_image(img_path_or_array, resolution=640):
             """Pathまたは画像配列を処理して適切なサイズに変換する"""
@@ -1440,7 +1679,7 @@ def worker(input_image, prompt, n_prompt, seed, total_second_length, latent_wind
                 stream.output_queue.push(('progress', (preview, desc, make_progress_bar_html(percentage, hint))))
                 return
             
-            if input_video is not None:
+            if video_latents is not None:
                 print("[DEBUG] video_latents.shape: ", video_latents.shape)
                 latents = video_latents[:, :, latent_window_size*i_section:latent_window_size*(i_section+1), :, :]
                 print("[DEBUG] latents.shape: ", latents.shape)
@@ -2428,7 +2667,7 @@ def validate_images(input_image, section_settings, length_radio=None, frame_size
     error_bar = make_progress_bar_html(100, translate('画像がありません'))
     return False, error_html + error_bar
 
-def process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
+def process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
     # プロセス関数の最初でVAEキャッシュ設定を確認
     global stream
     global batch_stopped
@@ -2934,6 +3173,8 @@ def process(input_image, prompt, n_prompt, seed, total_second_length, latent_win
         async_run(
             worker,
             current_input_image,  # イメージキューで変更された可能性がある入力画像
+            input_video,
+            denoise_strength,
             current_prompt,  # バッチ処理で更新された可能性があるプロンプト
             n_prompt,
             current_seed,  # バッチ処理で更新された可能性があるシード値
@@ -5952,7 +6193,7 @@ with block:
             # プロンプト管理パネル（右カラムから左カラムに移動済み）
 
     # 実行前のバリデーション関数
-    def validate_and_process(input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
+    def validate_and_process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
         """入力画像または最後のキーフレーム画像のいずれかが有効かどうかを確認し、問題がなければ処理を実行する"""
         # Gradioオブジェクトの場合は値を取得（save_settings_on_start）
         actual_save_settings_value = save_settings_on_start
@@ -6274,7 +6515,7 @@ with block:
 
     # 実行ボタンのイベント
     # UIから渡されるパラメーターリスト
-    ips = [input_image, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf, all_padding_value, end_frame, end_frame_strength, frame_size_radio, keep_section_videos, lora_files, lora_files2, lora_files3, lora_scales_text, output_dir, save_section_frames, section_settings, use_all_padding, use_lora, lora_mode, lora_dropdown1, lora_dropdown2, lora_dropdown3, save_tensor_data, tensor_data_input, fp8_optimization, resolution, batch_count, frame_save_mode, use_vae_cache, use_queue, prompt_queue_file]
+    ips = [input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf, all_padding_value, end_frame, end_frame_strength, frame_size_radio, keep_section_videos, lora_files, lora_files2, lora_files3, lora_scales_text, output_dir, save_section_frames, section_settings, use_all_padding, use_lora, lora_mode, lora_dropdown1, lora_dropdown2, lora_dropdown3, save_tensor_data, tensor_data_input, fp8_optimization, resolution, batch_count, frame_save_mode, use_vae_cache, use_queue, prompt_queue_file]
     
     start_button.click(fn=validate_and_process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed])
     end_button.click(fn=end_process, outputs=[end_button])

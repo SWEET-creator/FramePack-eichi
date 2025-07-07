@@ -59,7 +59,7 @@ def sample_hunyuan(
     if batch_size is None:
         batch_size = int(prompt_embeds.shape[0])
 
-    if denoise_strength < 1.0:
+    if denoise_strength < 1.0 and latents is not None:
         noise = torch.randn_like(latents)
 
         # flux_muを使用してノイズレベルを計算
