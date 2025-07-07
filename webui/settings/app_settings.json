@@ -1,3 +1,22 @@
 {
-  "output_folder": "outputs"
+  "output_folder": "/root/FramePack-eichi/webui/outputs/batch_generated",
+  "app_settings_eichi": {
+    "resolution": 640,
+    "mp4_crf": 16,
+    "steps": 25,
+    "cfg": 1.0,
+    "use_teacache": true,
+    "gpu_memory_preservation": 6,
+    "use_vae_cache": false,
+    "gs": 10.0,
+    "use_all_padding": false,
+    "all_padding_value": 1.0,
+    "end_frame_strength": 1.0,
+    "keep_section_videos": false,
+    "save_section_frames": false,
+    "save_tensor_data": false,
+    "frame_save_mode": "保存しない",
+    "save_settings_on_start": false,
+    "alarm_on_completion": true
+  }
 }

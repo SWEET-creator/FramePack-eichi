@@ -1,0 +1,23 @@
+{
+  "presets": [
+    {
+      "name": "デフォルト設定1",
+      "lora1": "なし",
+      "lora2": "なし",
+      "lora3": "なし",
+      "scales": "0.8,0.8,0.8",
+      "timestamp": "2025-06-24T16:43:58.223488",
+      "is_default": true
+    },
+    {
+      "name": "デフォルト設定2",
+      "lora1": "なし",
+      "lora2": "なし",
+      "lora3": "なし",
+      "scales": "1.0,0.5,0.3",
+      "timestamp": "2025-06-24T16:43:58.223498",
+      "is_default": true
+    }
+  ],
+  "default_preset_index": 0
+}
