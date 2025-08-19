@@ -709,7 +709,20 @@ def worker(
             # Pathの場合はPILで画像を開く
             if isinstance(img_path_or_array, str) and os.path.exists(img_path_or_array):
                 # print(translate("[DEBUG] ファイルから画像を読み込み: {0}").format(img_path_or_array))
-                img = np.array(Image.open(img_path_or_array).convert("RGB"))
+                # 透過チャンネルがある場合は白背景で合成
+                pil_img = Image.open(img_path_or_array)
+                if pil_img.mode in ('RGBA', 'LA') or 'transparency' in pil_img.info:
+                    # 白背景を作成
+                    white_bg = Image.new('RGB', pil_img.size, (255, 255, 255))
+                    if pil_img.mode == 'RGBA':
+                        white_bg.paste(pil_img, (0, 0), pil_img)
+                    elif pil_img.mode == 'LA':
+                        white_bg.paste(pil_img.convert('RGBA'), (0, 0), pil_img.convert('RGBA'))
+                    else:
+                        white_bg.paste(pil_img.convert('RGBA'), (0, 0), pil_img.convert('RGBA'))
+                    img = np.array(white_bg)
+                else:
+                    img = np.array(pil_img.convert("RGB"))
             else:
                 # NumPy配列の場合はそのまま使う
                 img = img_path_or_array
@@ -4664,7 +4677,20 @@ with block:
                         img_path_or_array
                     ):
                         # print(translate("[DEBUG] ファイルから画像を読み込み: {0}").format(img_path_or_array))
-                        img = np.array(Image.open(img_path_or_array).convert("RGB"))
+                        # 透過チャンネルがある場合は白背景で合成
+                pil_img = Image.open(img_path_or_array)
+                if pil_img.mode in ('RGBA', 'LA') or 'transparency' in pil_img.info:
+                    # 白背景を作成
+                    white_bg = Image.new('RGB', pil_img.size, (255, 255, 255))
+                    if pil_img.mode == 'RGBA':
+                        white_bg.paste(pil_img, (0, 0), pil_img)
+                    elif pil_img.mode == 'LA':
+                        white_bg.paste(pil_img.convert('RGBA'), (0, 0), pil_img.convert('RGBA'))
+                    else:
+                        white_bg.paste(pil_img.convert('RGBA'), (0, 0), pil_img.convert('RGBA'))
+                    img = np.array(white_bg)
+                else:
+                    img = np.array(pil_img.convert("RGB"))
                     else:
                         # NumPy配列の場合はそのまま使う
                         img = img_path_or_array

@@ -370,14 +370,15 @@ def video_encode(video_path, resolution, no_resize, vae, vae_batch_size=16, devi
         # スロー用の繰り返し回数を計算
         target_frames = 36
         num_real_frames = frames.shape[0]
-        repeat_factor = target_frames // num_real_frames  # 36÷12 = 3
-
-        # 整数倍で割り切れない場合はエラーにするか、floor/ceil 処理を入れてもOK
-        if target_frames % num_real_frames != 0:
-            raise ValueError(f"target_frames ({target_frames}) must be divisible by num_real_frames ({num_real_frames})")
-
-        # 時間方向に繰り返す
-        frames = np.repeat(frames, repeat_factor, axis=0)
+        
+        # フレーム数が36でない場合、引き伸ばしてtarget_framesに合わせる
+        if num_real_frames != target_frames:
+            # 各元フレームを何回繰り返すかを計算
+            indices = np.linspace(0, num_real_frames - 1, target_frames).astype(int)
+            frames = frames[indices]
+            print(f"Stretched frames from {num_real_frames} to {target_frames} frames")
+        else:
+            print(f"Frames already match target: {target_frames} frames")
 
         print(f"After slow-motion: {frames.shape}")
 
@@ -553,9 +554,10 @@ def get_video_dimensions(video_path):
 
 # 20250506 pftq: Added function to encode input video frames into latents
 @torch.no_grad()
-def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_index=None, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, alarm_on_completion=False):
+def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, heatmap_guidance_strength=0.0, keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_index=None, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, alarm_on_completion=False):
     # グローバル変数を使用
     global vae_cache_enabled, current_prompt
+    print(f"[DEBUG] Worker function called with heatmap_guidance_strength={heatmap_guidance_strength}")
     # パラメータ経由の値とグローバル変数の値を確認
     print(translate("worker関数でのVAEキャッシュ設定: パラメータ={0}, グローバル変数={1}").format(use_vae_cache, vae_cache_enabled))
 
@@ -1107,7 +1109,20 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
 
             # Pathの場合はPILで画像を開く
             if isinstance(img_path_or_array, str) and os.path.exists(img_path_or_array):
-                img = np.array(Image.open(img_path_or_array).convert('RGB'))
+                # 透過チャンネルがある場合は白背景で合成
+                pil_img = Image.open(img_path_or_array)
+                if pil_img.mode in ('RGBA', 'LA') or 'transparency' in pil_img.info:
+                    # 白背景を作成
+                    white_bg = Image.new('RGB', pil_img.size, (255, 255, 255))
+                    if pil_img.mode == 'RGBA':
+                        white_bg.paste(pil_img, (0, 0), pil_img)
+                    elif pil_img.mode == 'LA':
+                        white_bg.paste(pil_img.convert('RGBA'), (0, 0), pil_img.convert('RGBA'))
+                    else:
+                        white_bg.paste(pil_img.convert('RGBA'), (0, 0), pil_img.convert('RGBA'))
+                    img = np.array(white_bg)
+                else:
+                    img = np.array(pil_img.convert('RGB'))
             else:
                 # NumPy配列の場合はそのまま使う
                 img = img_path_or_array
@@ -1686,8 +1701,17 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
             else:
                 latents = None
                 denoise_strength = 1.0
+            print(f"[DEBUG] Calling sample_hunyuan with heatmap_guidance_strength={heatmap_guidance_strength}")
+            
+            # Parameter validation
+            if not isinstance(heatmap_guidance_strength, (int, float)):
+                raise ValueError(f"heatmap_guidance_strength must be a number, got {type(heatmap_guidance_strength)}")
+            if heatmap_guidance_strength < 0.0:
+                raise ValueError(f"heatmap_guidance_strength must be >= 0.0, got {heatmap_guidance_strength}")
+            
             generated_latents = sample_hunyuan(
                 transformer=transformer,
+                vae=vae,
                 sampler='unipc',
                 width=width,
                 height=height,
@@ -1708,6 +1732,7 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
                 dtype=torch.bfloat16,
+                heatmap_guidance_strength=heatmap_guidance_strength,
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
@@ -1718,6 +1743,11 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
                 clean_latent_4x_indices=clean_latent_4x_indices,
                 callback=callback,
             )
+            
+            # デバッグ: 生成されたlatentsの統計情報を確認
+            print(f"[DEBUG] Generated latents stats: mean={generated_latents.mean().item():.6f}, std={generated_latents.std().item():.6f}")
+            print(f"[DEBUG] Generated latents shape: {generated_latents.shape}")
+            print(f"[DEBUG] Edge enhancement strength used: {heatmap_guidance_strength}")
 
             if is_first_section:
                 # 末尾から削除するフレームサイズを計算
@@ -2127,8 +2157,17 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
                                     clean_latents_2 = torch.cat([real_history_last_latent.unsqueeze(2), clean_latents_post_2[:, :, :1, :, :]], dim=2)
 
                                     # 補間フレームを生成
+                                    print(f"[DEBUG] Calling interpolation sample_hunyuan with heatmap_guidance_strength={heatmap_guidance_strength}")
+                                    
+                                    # Parameter validation
+                                    if not isinstance(heatmap_guidance_strength, (int, float)):
+                                        raise ValueError(f"heatmap_guidance_strength must be a number, got {type(heatmap_guidance_strength)}")
+                                    if heatmap_guidance_strength < 0.0:
+                                        raise ValueError(f"heatmap_guidance_strength must be >= 0.0, got {heatmap_guidance_strength}")
+                                    
                                     generated_interpolation_latents = sample_hunyuan(
                                         transformer=transformer,
+                                        vae=vae,
                                         sampler='unipc',
                                         width=width,
                                         height=height,
@@ -2147,6 +2186,7 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
                                         negative_prompt_poolers=clip_l_pooler_n,
                                         device=gpu,
                                         dtype=torch.bfloat16,
+                                        heatmap_guidance_strength=heatmap_guidance_strength,
                                         image_embeddings=image_encoder_last_hidden_state,
                                         latent_indices=latent_indices_2,
                                         clean_latents=clean_latents_2,
@@ -2590,7 +2630,8 @@ def worker(input_image, input_video, denoise_strength, prompt, n_prompt, seed, t
 
             if not high_vram:
                 unload_complete_models()
-    except:
+    except Exception as e:
+        print(f"❌ Main worker error: {e}")
         traceback.print_exc()
 
         if not high_vram:
@@ -2667,7 +2708,7 @@ def validate_images(input_image, section_settings, length_radio=None, frame_size
     error_bar = make_progress_bar_html(100, translate('画像がありません'))
     return False, error_html + error_bar
 
-def process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
+def process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, heatmap_guidance_strength=0.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
     # プロセス関数の最初でVAEキャッシュ設定を確認
     global stream
     global batch_stopped
@@ -3190,6 +3231,7 @@ def process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, 
             all_padding_value,
             end_frame,
             end_frame_strength,
+            heatmap_guidance_strength,
             keep_section_videos,
             lora_files,
             lora_files2,
@@ -5846,6 +5888,16 @@ with block:
                     info=translate("最終フレームが動画全体に与える影響の強さを調整します。値を小さくすると最終フレームの影響が弱まり、最初のフレームに早く移行します。1.00が通常の動作です。"),
                     elem_classes="saveable-setting"
                 )
+                
+                heatmap_guidance_strength = gr.Slider(
+                    label=translate("heatmap_guidance_strength"),
+                    minimum=0.0,
+                    maximum=10.0,
+                    value=saved_app_settings.get("heatmap_guidance_strength", 0.0) if saved_app_settings else 0.0,
+                    step=0.1,
+                    info=translate("推論時にエッジを強調するガイダンスの強度を調整します。0.0で無効、値を大きくするとエッジがより際立ちます。"),
+                    elem_classes="saveable-setting"
+                )
 
             # 出力フォルダ設定
             gr.Markdown(translate("※ 出力先は `webui` 配下に限定されます"))
@@ -5977,6 +6029,7 @@ with block:
                 use_all_padding_val,
                 all_padding_value_val,
                 end_frame_strength_val,
+                heatmap_guidance_strength_val,
                 keep_section_videos_val,
                 save_section_frames_val,
                 save_tensor_data_val,
@@ -6009,6 +6062,7 @@ with block:
                     "all_padding_value": all_padding_value_val,
                     # エンドフレーム設定
                     "end_frame_strength": end_frame_strength_val,
+                    "heatmap_guidance_strength": heatmap_guidance_strength_val,
                     # 保存設定
                     "keep_section_videos": keep_section_videos_val,
                     "save_section_frames": save_section_frames_val,
@@ -6098,6 +6152,7 @@ with block:
                 
                 # エンドフレーム設定
                 updates.append(gr.update(value=default_settings["end_frame_strength"]))
+                updates.append(gr.update(value=default_settings["heatmap_guidance_strength"]))
                 
                 # 保存設定
                 updates.append(gr.update(value=default_settings["keep_section_videos"]))
@@ -6149,6 +6204,7 @@ with block:
                     use_all_padding,
                     all_padding_value,
                     end_frame_strength,
+                    heatmap_guidance_strength,
                     keep_section_videos,
                     save_section_frames,
                     save_tensor_data,
@@ -6162,7 +6218,7 @@ with block:
                 outputs=[settings_status]
             )
             
-            # リセットボタンのクリックイベント (20出力)
+            # リセットボタンのクリックイベント (21出力)
             reset_settings_btn.click(
                 fn=reset_app_settings_handler,
                 inputs=[],
@@ -6178,23 +6234,25 @@ with block:
                     use_all_padding,      # 9
                     all_padding_value,    # 10
                     end_frame_strength,   # 11
-                    keep_section_videos,  # 12
-                    save_section_frames,  # 13
-                    save_tensor_data,     # 14
-                    frame_save_mode,      # 15
-                    save_settings_on_start, # 16
-                    alarm_on_completion,  # 17
-                    log_enabled,          # 18
-                    log_folder,           # 19
-                    settings_status       # 20
+                    heatmap_guidance_strength, # 12
+                    keep_section_videos,  # 13
+                    save_section_frames,  # 14
+                    save_tensor_data,     # 15
+                    frame_save_mode,      # 16
+                    save_settings_on_start, # 17
+                    alarm_on_completion,  # 18
+                    log_enabled,          # 19
+                    log_folder,           # 20
+                    settings_status       # 21
                 ]
             )
 
             # プロンプト管理パネル（右カラムから左カラムに移動済み）
 
     # 実行前のバリデーション関数
-    def validate_and_process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
+    def validate_and_process(input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf=16, all_padding_value=1.0, end_frame=None, end_frame_strength=1.0, heatmap_guidance_strength=0.0, frame_size_setting="1秒 (33フレーム)", keep_section_videos=False, lora_files=None, lora_files2=None, lora_files3=None, lora_scales_text="0.8,0.8,0.8", output_dir=None, save_section_frames=False, section_settings=None, use_all_padding=False, use_lora=False, lora_mode=None, lora_dropdown1=None, lora_dropdown2=None, lora_dropdown3=None, save_tensor_data=False, tensor_data_input=None, fp8_optimization=False, resolution=640, batch_count=1, frame_save_mode="保存しない", use_vae_cache=False, use_queue=False, prompt_queue_file=None, save_settings_on_start=False, alarm_on_completion=False):
         """入力画像または最後のキーフレーム画像のいずれかが有効かどうかを確認し、問題がなければ処理を実行する"""
+        print(f"[DEBUG] validate_and_process called with heatmap_guidance_strength={heatmap_guidance_strength}")
         # Gradioオブジェクトの場合は値を取得（save_settings_on_start）
         actual_save_settings_value = save_settings_on_start
         
@@ -6317,6 +6375,7 @@ with block:
                 "all_padding_value": all_padding_value,
                 # エンドフレーム設定
                 "end_frame_strength": end_frame_strength,
+                "heatmap_guidance_strength": heatmap_guidance_strength,
                 # フレーム設定
                 "frame_size_radio": frame_size_setting,
                 # 保存設定
@@ -6485,6 +6544,7 @@ with block:
             all_padding_value=all_padding_value,
             end_frame=end_frame,
             end_frame_strength=end_frame_strength,
+            heatmap_guidance_strength=heatmap_guidance_strength,
             frame_size_setting=frame_size_setting,
             keep_section_videos=keep_section_videos,
             lora_files=lora_files,
@@ -6515,7 +6575,7 @@ with block:
 
     # 実行ボタンのイベント
     # UIから渡されるパラメーターリスト
-    ips = [input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf, all_padding_value, end_frame, end_frame_strength, frame_size_radio, keep_section_videos, lora_files, lora_files2, lora_files3, lora_scales_text, output_dir, save_section_frames, section_settings, use_all_padding, use_lora, lora_mode, lora_dropdown1, lora_dropdown2, lora_dropdown3, save_tensor_data, tensor_data_input, fp8_optimization, resolution, batch_count, frame_save_mode, use_vae_cache, use_queue, prompt_queue_file]
+    ips = [input_image, input_video, denoise_strength, prompt, n_prompt, seed, total_second_length, latent_window_size, steps, cfg, gs, rs, gpu_memory_preservation, use_teacache, use_random_seed, mp4_crf, all_padding_value, end_frame, end_frame_strength, heatmap_guidance_strength, frame_size_radio, keep_section_videos, lora_files, lora_files2, lora_files3, lora_scales_text, output_dir, save_section_frames, section_settings, use_all_padding, use_lora, lora_mode, lora_dropdown1, lora_dropdown2, lora_dropdown3, save_tensor_data, tensor_data_input, fp8_optimization, resolution, batch_count, frame_save_mode, use_vae_cache, use_queue, prompt_queue_file]
     
     start_button.click(fn=validate_and_process, inputs=ips, outputs=[result_video, preview_image, progress_desc, progress_bar, start_button, end_button, seed])
     end_button.click(fn=end_process, outputs=[end_button])

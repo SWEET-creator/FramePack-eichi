@@ -656,12 +656,10 @@ class ConfigQueueManager:
                     self._move_to_error(config_name, error_msg)
                     total_errors += 1
                     print(f"❌ Error processing {config_name}: {e}")
-                    import traceback
                     traceback.print_exc()
                     
         except Exception as e:
             print(f"❌ Queue worker error: {e}")
-            import traceback
             traceback.print_exc()
         finally:
             # Always reset processing state

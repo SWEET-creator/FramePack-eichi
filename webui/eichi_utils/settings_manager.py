@@ -162,6 +162,7 @@ def get_default_app_settings(current_lang="ja"):
         
         # エンドフレーム設定
         "end_frame_strength": 1.0,
+        "edge_enhancement_strength": 0.0,
         
         # 保存設定
         "keep_section_videos": False,
