@@ -50,7 +50,7 @@ def load_auto_refine_model(checkpoint_path="/root/auto-refine/outputs/outputs_sp
                            model_type='unet', device='cuda', mode="image"):
     """
     auto-refineモデルをロードする
-    mode: "image" = ピクセル空間(3ch), "latent" = latent空間(16ch)
+    mode: "image" = ピクセル空間(3ch)のみサポート
     """
     print(f"[DEBUG] load_auto_refine_model called with:")
     print(f"[DEBUG]   checkpoint_path: {checkpoint_path}")
@@ -75,12 +75,9 @@ def load_auto_refine_model(checkpoint_path="/root/auto-refine/outputs/outputs_sp
         if mode == "image":
             n_channels = 3  # RGBピクセル空間
             print(f"[DEBUG] Using image mode: n_channels = {n_channels}")
-        elif mode == "latent":
-            n_channels = 16  # HunyuanVideo latent空間
-            print(f"[DEBUG] Using latent mode: n_channels = {n_channels}")
         else:
             print(f"[DEBUG] ERROR: Unsupported mode: {mode}")
-            raise ValueError(f"Unsupported mode: {mode}. Use 'image' or 'latent'.")
+            raise ValueError(f"Unsupported mode: {mode}. Only 'image' mode is supported.")
         
         # モデルを作成
         print(f"[DEBUG] Creating model with create_model({model_type}, n_channels={n_channels}, n_classes=1)...")
@@ -195,7 +192,6 @@ def sample_hunyuan(
         heatmap_guidance_scale=1.0,
         heatmap_guidance_steps=5,  # ★ 最後のnステップでのみガイダンスを適用
         auto_refine_checkpoint="/root/auto-refine/outputs/outputs_spatial/best_model.pth",
-        degradation_mode="image",  # ★ 新しいパラメータ: "image" または "latent"
         **kwargs,
 ):
     # デフォルトデバイスをMAIN_GPUに設定（拡散処理用）
@@ -215,10 +211,10 @@ def sample_hunyuan(
     auto_refine_device = None
     if heatmap_guidance_strength > 0.0:
         # auto-refineモデルはGPU_VAEに配置
-        model_result = load_auto_refine_model(auto_refine_checkpoint, 'unet', GPU_VAE, degradation_mode)
+        model_result = load_auto_refine_model(auto_refine_checkpoint, 'unet', GPU_VAE, "image")
         if model_result is not None:
             auto_refine_model, auto_refine_device = model_result
-            print(f"[DEBUG] Using degradation model in {degradation_mode} mode on {auto_refine_device}")
+            print(f"[DEBUG] Using degradation model in image mode on {auto_refine_device}")
             print(f"[DEBUG] Heatmap guidance will be applied in last {heatmap_guidance_steps} steps out of {num_inference_steps} total steps")
             print(f"[DEBUG] Guidance will start from step {num_inference_steps - heatmap_guidance_steps}")
 
@@ -408,12 +404,12 @@ def sample_hunyuan(
                 print("x_t.requires_grad:", x_t.requires_grad)
                 print("eps.requires_grad:", eps.requires_grad)
                 print("x0_hat.requires_grad:", x0_hat.requires_grad)
-                # 2. degradation_modeに応じて画像を準備（チャンクベース処理）
-                print(f"[DEBUG] Step {i}: Starting degradation mode processing: {degradation_mode}")
+                # 2. VAEを使用してピクセル空間でヒートマップガイダンスを実行（チャンクベース処理）
+                print(f"[DEBUG] Step {i}: Starting VAE-based heatmap guidance processing")
                 img = None
                 grad_buf = torch.zeros_like(x_t)  # 勾配蓄積用バッファ
                 
-                if degradation_mode == "image" and vae is not None:
+                if vae is not None:
                     print(f"[DEBUG] Step {i}: Entering image mode VAE processing")
                     try:
                         print(f"[DEBUG] Step {i}: Converting x0_hat to fp16 and cloning to avoid inference tensor issues")
@@ -577,7 +573,7 @@ def sample_hunyuan(
                                             print(f"[WARNING] Step {i}: Invalid heatmap mean, using zero")
                                             heatmap_mean = torch.zeros_like(heatmap_mean)
                                         
-                                        heat_loss = heatmap_mean * heatmap_guidance_strength
+                                        heat_loss = (1 - heatmap_mean) * heatmap_guidance_strength
                                         
                                         # heat_loss の NaN/Inf チェック
                                         if torch.isnan(heat_loss).any():
@@ -700,7 +696,7 @@ def sample_hunyuan(
                                     print(f"[WARNING] Step {i}: Invalid heatmap mean (single frame), using zero")
                                     heatmap_mean = torch.zeros_like(heatmap_mean)
                                 
-                                loss = heatmap_mean * heatmap_guidance_strength
+                                loss = (1 - heatmap_mean) * heatmap_guidance_strength
                                 
                                 # loss の NaN/Inf チェック (single frame case)
                                 if torch.isnan(loss).any():
@@ -734,205 +730,9 @@ def sample_hunyuan(
                         import traceback
                         print(f"[DEBUG] Step {i}: Traceback: {traceback.format_exc()}")
                         raise
-                elif degradation_mode == "latent" or (degradation_mode == "image" and img is None):
-                    # latent空間モード: x0_hatを直接使用（VAEデコード不要、チャンクベース）
-                    try:
-                        effective_mode = "latent" if degradation_mode == "latent" else "latent (fallback)"
-                        print(f"[DEBUG] Step {i}: Using {effective_mode} mode for heatmap guidance")
-                        print(f"[DEBUG] Step {i}: x0_hat shape: {x0_hat.shape}, dim: {x0_hat.dim()}")
-                        
-                        if x0_hat.dim() == 5:                  # (B,16,T,H8,W8)
-                            B, C16, T, H8, W8 = x0_hat.shape
-                            chunk_T = min(1, T)  # チャンクサイズ（メモリに応じて調整）
-                            print(f"[DEBUG] Step {i}: Processing {T} latent frames in chunks of {chunk_T}")
-                            
-                            for start in range(0, T, chunk_T):
-                                end = min(start + chunk_T, T)
-                                print(f"[DEBUG] Step {i}: Processing latent chunk {start}:{end}")
-                                
-                                # ---- 1) latent チャンク抽出 ----
-                                print(f"[DEBUG] Step {i}: Extracting latent chunk {start}:{end}")
-                                
-                                # x0_hatのNaN/Infチェック（latent mode）
-                                chunk_source = x0_hat[:, :, start:end, :, :]
-                                if torch.isnan(chunk_source).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in latent chunk source!")
-                                    print(f"[DEBUG] chunk_source stats: min={chunk_source.min().item():.6f}, max={chunk_source.max().item():.6f}")
-                                    print(f"[WARNING] Step {i}: Skipping latent chunk {start}:{end} due to NaN")
-                                    continue
-                                
-                                if torch.isinf(chunk_source).any():
-                                    print(f"[ERROR] Step {i}: Inf detected in latent chunk source!")
-                                    chunk_source = torch.clamp(chunk_source, min=-50.0, max=50.0)
-                                    print(f"[WARNING] Step {i}: Clamped Inf values in latent chunk source")
-                                
-                                latent_chunk = chunk_source.clone().cpu()        # CPU へ, clone()追加
-                                latent_chunk = latent_chunk.float().requires_grad_(True)   # 独立コピー + 勾配有効化
-                                print(f"[DEBUG] Step {i}: Latent chunk prepared, requires_grad = {latent_chunk.requires_grad}")
-                                print(f"[DEBUG] Step {i}: latent chunk range: [{latent_chunk.min().item():.6f}, {latent_chunk.max().item():.6f}]")
-                                
-                                # ---- 2) forward (heat-map) ----
-                                with torch.set_grad_enabled(True):
-                                    # CPUからGPUへ移動（auto_refine_modelと同じデバイス）
-                                    latent_chunk = latent_chunk.to(auto_refine_device, non_blocking=True)
-                                    
-                                    # フレームごと heat-map → loss
-                                    loss = torch.zeros(1, device=latent_chunk.device, dtype=x_t.dtype, requires_grad=True)
-                                    chunk_frames = latent_chunk.size(2)
-                                    
-                                    for t_idx in range(chunk_frames):
-                                        latent_frame = latent_chunk[:, :, t_idx]  # (B, 16, H8, W8)
-                                        
-                                        try:
-                                            # latent frameを安全な範囲にクランプ
-                                            safe_latent_frame = torch.clamp(latent_frame, min=-50.0, max=50.0)
-                                            heatmap = auto_refine_model(safe_latent_frame)  # (B, 1, H8, W8)
-                                        except Exception as model_error:
-                                            print(f"[ERROR] Step {i}: auto_refine_model failed (latent mode): {model_error}")
-                                            print(f"[DEBUG] latent_frame stats: min={latent_frame.min().item():.6f}, max={latent_frame.max().item():.6f}")
-                                            raise RuntimeError(f"auto_refine_model failed at step {i}, latent frame {t_idx}: {model_error}")
-                                        
-                                        # NaN/Inf チェック (latent mode)
-                                        if torch.isnan(heatmap).any():
-                                            print(f"[ERROR] Step {i}: NaN detected in heatmap (latent mode)!")
-                                            print(f"[DEBUG] latent_frame stats: min={latent_frame.min().item():.6f}, max={latent_frame.max().item():.6f}")
-                                            print(f"[WARNING] Step {i}: Replacing NaN heatmap with zeros (latent mode)")
-                                            heatmap = torch.zeros_like(heatmap)
-                                        if torch.isinf(heatmap).any():
-                                            print(f"[ERROR] Step {i}: Inf detected in heatmap (latent mode)!")
-                                            print(f"[WARNING] Step {i}: Clamping Inf heatmap values (latent mode)")
-                                            heatmap = torch.clamp(heatmap, min=-10.0, max=10.0)
-                                        
-                                        # 安全なheat_loss計算
-                                        heatmap_mean = heatmap.mean()
-                                        if torch.isnan(heatmap_mean) or torch.isinf(heatmap_mean):
-                                            print(f"[WARNING] Step {i}: Invalid heatmap mean (latent mode), using zero")
-                                            heatmap_mean = torch.zeros_like(heatmap_mean)
-                                        
-                                        heat_loss = heatmap_mean * heatmap_guidance_strength
-                                        
-                                        # heat_loss の NaN/Inf チェック (latent mode)
-                                        if torch.isnan(heat_loss).any():
-                                            print(f"[ERROR] Step {i}: NaN detected in heat_loss (latent mode)!")
-                                            print(f"[DEBUG] heat_loss = {heat_loss.item():.6f}")
-                                            raise RuntimeError(f"NaN detected in heat_loss at step {i}, latent frame {t_idx}")
-                                        if torch.isinf(heat_loss).any():
-                                            print(f"[ERROR] Step {i}: Inf detected in heat_loss (latent mode)!")
-                                            raise RuntimeError(f"Inf detected in heat_loss at step {i}, latent frame {t_idx}")
-                                        
-                                        loss = loss + heat_loss / chunk_frames  # チャンク内で平均
-                                        
-                                        # accumulated loss の NaN/Inf チェック (latent mode)
-                                        if torch.isnan(loss).any():
-                                            print(f"[ERROR] Step {i}: NaN detected in accumulated loss (latent mode)!")
-                                            print(f"[DEBUG] loss = {loss.item():.6f}")
-                                            raise RuntimeError(f"NaN detected in accumulated loss at step {i}, latent frame {t_idx}")
-                                        if torch.isinf(loss).any():
-                                            print(f"[ERROR] Step {i}: Inf detected in accumulated loss (latent mode)!")
-                                            raise RuntimeError(f"Inf detected in accumulated loss at step {i}, latent frame {t_idx}")
-                                
-                                # ---- 3) backward → grad 取得 & 蓄積 ----
-                                g, = torch.autograd.grad(loss, latent_chunk, retain_graph=False)
-                                
-                                # latent → x_t への chain rule
-                                g_xt, = torch.autograd.grad(latent_chunk, x_t,
-                                                            grad_outputs=g,
-                                                            retain_graph=True)
-                                
-                                # x_tの該当部分に勾配を蓄積（g_xtをchunkサイズにスライス）
-                                g_xt_chunk = g_xt[:, :, start:end, :, :]
-                                grad_buf[:, :, start:end, :, :] += g_xt_chunk.detach()
-                                
-                                # ---- 4) メモリ解放 ----
-                                del latent_chunk, g, g_xt, loss
-                                torch.cuda.empty_cache()
-                                
-                        elif x0_hat.dim() == 4:                # (B,16,H8,W8) - 単一フレーム
-                            B, C16, H8, W8 = x0_hat.shape
-                            print(f"[DEBUG] Step {i}: Processing single latent frame")
-                            
-                            # ---- 1) latent 準備 ----
-                            print(f"[DEBUG] Step {i}: Preparing single latent frame")
-                            
-                            # x0_hatのNaN/Infチェック（single latent frame）
-                            if torch.isnan(x0_hat).any():
-                                print(f"[ERROR] Step {i}: NaN detected in x0_hat (single latent frame)!")
-                                print(f"[DEBUG] x0_hat stats: min={x0_hat.min().item():.6f}, max={x0_hat.max().item():.6f}")
-                                print(f"[WARNING] Step {i}: Skipping single latent frame processing due to NaN")
-                                return torch.zeros_like(x_t)  # 安全なゼロ勾配を返す
-                            
-                            if torch.isinf(x0_hat).any():
-                                print(f"[ERROR] Step {i}: Inf detected in x0_hat (single latent frame)!")
-                                x0_hat = torch.clamp(x0_hat, min=-50.0, max=50.0)
-                                print(f"[WARNING] Step {i}: Clamped Inf values in x0_hat (single latent frame)")
-                            
-                            latent = x0_hat.clone().cpu().float().requires_grad_(True)  # CPU経由で独立コピー, clone()追加
-                            print(f"[DEBUG] Step {i}: Single latent frame prepared, requires_grad = {latent.requires_grad}")
-                            print(f"[DEBUG] Step {i}: single latent frame range: [{latent.min().item():.6f}, {latent.max().item():.6f}]")
-                            
-                            # ---- 2) forward ----
-                            with torch.set_grad_enabled(True):
-                                # CPUからGPUへ移動
-                                latent = latent.to(auto_refine_device, non_blocking=True)
-                                
-                                try:
-                                    # latentを安全な範囲にクランプ
-                                    safe_latent = torch.clamp(latent, min=-50.0, max=50.0)
-                                    heatmap = auto_refine_model(safe_latent)
-                                except Exception as model_error:
-                                    print(f"[ERROR] Step {i}: auto_refine_model failed (single latent frame): {model_error}")
-                                    print(f"[DEBUG] latent stats: min={latent.min().item():.6f}, max={latent.max().item():.6f}")
-                                    raise RuntimeError(f"auto_refine_model failed at step {i} (single latent frame): {model_error}")
-                                
-                                # NaN/Inf チェック (single latent frame)
-                                if torch.isnan(heatmap).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in heatmap (single latent frame)!")
-                                    print(f"[DEBUG] latent stats: min={latent.min().item():.6f}, max={latent.max().item():.6f}")
-                                    print(f"[WARNING] Step {i}: Replacing NaN heatmap with zeros (single latent frame)")
-                                    heatmap = torch.zeros_like(heatmap)
-                                if torch.isinf(heatmap).any():
-                                    print(f"[ERROR] Step {i}: Inf detected in heatmap (single latent frame)!")
-                                    print(f"[WARNING] Step {i}: Clamping Inf heatmap values (single latent frame)")
-                                    heatmap = torch.clamp(heatmap, min=-10.0, max=10.0)
-                                
-                                # 安全なloss計算
-                                heatmap_mean = heatmap.mean()
-                                if torch.isnan(heatmap_mean) or torch.isinf(heatmap_mean):
-                                    print(f"[WARNING] Step {i}: Invalid heatmap mean (single latent frame), using zero")
-                                    heatmap_mean = torch.zeros_like(heatmap_mean)
-                                
-                                loss = heatmap_mean * heatmap_guidance_strength
-                                
-                                # loss の NaN/Inf チェック (single latent frame)
-                                if torch.isnan(loss).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in loss (single latent frame)!")
-                                    print(f"[DEBUG] loss = {loss.item():.6f}")
-                                    raise RuntimeError(f"NaN detected in loss at step {i} (single latent frame)")
-                                if torch.isinf(loss).any():
-                                    print(f"[ERROR] Step {i}: Inf detected in loss (single latent frame)!")
-                                    raise RuntimeError(f"Inf detected in loss at step {i} (single latent frame)")
-                            
-                            # ---- 3) backward ----
-                            g, = torch.autograd.grad(loss, latent, retain_graph=False)
-                            g_xt, = torch.autograd.grad(latent, x_t,
-                                                        grad_outputs=g,
-                                                        retain_graph=False)
-                            grad_buf += g_xt.detach()
-                            
-                            # ---- 4) メモリ解放 ----
-                            del latent, g, g_xt, loss
-                            torch.cuda.empty_cache()
-
-                        else:
-                            raise RuntimeError(f"Unexpected x0_hat dim {x0_hat.dim()}")
-                            
-                        print(f"[DEBUG] Step {i}: Chunk-based latent mode completed")
-                        
-                    except Exception as e:
-                        print(f"[DEBUG] Step {i}: Error in chunk-based latent processing: {e}")
-                        raise
                 else:
-                    print(f"[DEBUG] Step {i}: Skipping heatmap guidance (mode={degradation_mode})")
+                    # VAEが存在しない場合: ガイダンスをスキップ
+                    print(f"[DEBUG] Step {i}: VAE not available, skipping heatmap guidance")
                 
                 # ---- 最終処理: grad_buf を返す ----
                 print(f"[DEBUG] Step {i}: Returning accumulated gradients from chunks")
