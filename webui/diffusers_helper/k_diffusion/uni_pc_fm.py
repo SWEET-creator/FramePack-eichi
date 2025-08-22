@@ -212,6 +212,7 @@ class FlowMatchUniPC:
                     x = (x_req - cond_scale *
                          (vec_t**2).reshape(-1, *([1]*(x.dim()-1))) * g
                          ).detach()
+                    print(f"[DEBUG] Gradient guidance applied at step {i}")
                 else:
                     x = x_req.detach()
             # =============================================

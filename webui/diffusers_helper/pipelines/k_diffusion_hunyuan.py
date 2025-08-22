@@ -210,6 +210,7 @@ def sample_hunyuan(
     auto_refine_model = None
     auto_refine_device = None
     if heatmap_guidance_strength > 0.0:
+        print(f"[DEBUG] Attempting to load auto_refine_model with strength={heatmap_guidance_strength}")
         # auto-refineモデルはGPU_VAEに配置
         model_result = load_auto_refine_model(auto_refine_checkpoint, 'unet', GPU_VAE, "image")
         if model_result is not None:
@@ -217,6 +218,13 @@ def sample_hunyuan(
             print(f"[DEBUG] Using degradation model in image mode on {auto_refine_device}")
             print(f"[DEBUG] Heatmap guidance will be applied in last {heatmap_guidance_steps} steps out of {num_inference_steps} total steps")
             print(f"[DEBUG] Guidance will start from step {num_inference_steps - heatmap_guidance_steps}")
+        else:
+            print(f"[WARNING] auto_refine_model failed to load - heatmap guidance will be disabled")
+            print(f"[WARNING] Checkpoint path: {auto_refine_checkpoint}")
+            heatmap_guidance_strength = 0.0
+            print(f"[WARNING] Set heatmap_guidance_strength to 0.0 to disable guidance")
+    else:
+        print(f"[DEBUG] Heatmap guidance disabled (strength={heatmap_guidance_strength})")
 
     if batch_size is None:
         batch_size = int(prompt_embeds.shape[0])
@@ -319,13 +327,19 @@ def sample_hunyuan(
         if heatmap_guidance_strength <= 0.0:
             return torch.zeros_like(x_t)
         
+        # auto_refine_modelがNoneの場合はヒートマップガイダンスをスキップ
+        if auto_refine_model is None:
+            if i % 5 == 0:  # 5ステップごとにメッセージを表示
+                print(f"[DEBUG] Step {i}/{num_inference_steps}: Skipping heatmap guidance - auto_refine_model is None")
+            return torch.zeros_like(x_t)
+        
         # 最後のheatmap_guidance_stepsでのみガイダンスを適用
         if i < (num_inference_steps - heatmap_guidance_steps):
-            if i % 5 == 0:  # 5ステップごとにスキップメッセージを表示
+            if i % 5 == 0:  # 5ステップごりにスキップメッセージを表示
                 print(f"[DEBUG] Step {i}/{num_inference_steps}: Skipping heatmap guidance (will start at step {num_inference_steps - heatmap_guidance_steps})")
             return torch.zeros_like(x_t)
         
-        print(f"[DEBUG] Step {i}/{num_inference_steps}: Applying heatmap guidance ({degradation_mode} mode)")
+        print(f"[DEBUG] Step {i}/{num_inference_steps}: Applying heatmap guidance (image mode)")
         
         print(f"[DEBUG] Step {i}: x_t dtype: {x_t.dtype}, sigma dtype: {sigma.dtype}")
         
@@ -341,59 +355,12 @@ def sample_hunyuan(
                     torch.set_grad_enabled(True)
                     print(f"[DEBUG] Step {i}: eps dtype: {eps.dtype}")
                     
-                    # epsのNaN/Infチェック
-                    if torch.isnan(eps).any():
-                        print(f"[ERROR] Step {i}: NaN detected in eps prediction!")
-                        print(f"[DEBUG] eps stats: min={eps.min().item():.6f}, max={eps.max().item():.6f}")
-                        print(f"[DEBUG] x_t stats: min={x_t.min().item():.6f}, max={x_t.max().item():.6f}")
-                        print(f"[DEBUG] sigma: {sigma}")
-                        raise RuntimeError(f"NaN in eps prediction at step {i}")
-                    if torch.isinf(eps).any():
-                        print(f"[ERROR] Step {i}: Inf detected in eps prediction!")
-                        print(f"[DEBUG] eps stats: min={eps.min().item():.6f}, max={eps.max().item():.6f}")
-                        # Infを安全な値でクランプ
-                        eps = torch.clamp(eps, min=-100.0, max=100.0)
-                        print(f"[WARNING] Step {i}: Clamped Inf values in eps")
-                    
-                    # alpha計算の安全性強化
-                    sigma_safe = torch.clamp(sigma, min=1e-8, max=1000.0)  # sigma=0を避ける
-                    alpha = 1 / (sigma_safe**2 + 1)
-                    
-                    # alphaのNaN/Infチェック
-                    if torch.isnan(alpha).any() or torch.isinf(alpha).any():
-                        print(f"[ERROR] Step {i}: Invalid alpha computation!")
-                        print(f"[DEBUG] sigma: {sigma}, sigma_safe: {sigma_safe}")
-                        print(f"[DEBUG] alpha: {alpha}")
-                        raise RuntimeError(f"Invalid alpha at step {i}")
-                    
+                    # alpha計算
+                    alpha = 1 / (sigma**2 + 1)
                     alpha_sqrt = torch.sqrt(alpha.float()).to(alpha.dtype)
                     
-                    # alpha_sqrtのNaN/Infチェック
-                    if torch.isnan(alpha_sqrt).any() or torch.isinf(alpha_sqrt).any():
-                        print(f"[ERROR] Step {i}: Invalid alpha_sqrt computation!")
-                        print(f"[DEBUG] alpha: {alpha}, alpha_sqrt: {alpha_sqrt}")
-                        raise RuntimeError(f"Invalid alpha_sqrt at step {i}")
-                    
-                    # x0_hat計算（安全性強化）
-                    sigma_eps = sigma_safe * eps
-                    x_t_corrected = x_t - sigma_eps
-                    x0_hat = x_t_corrected * alpha_sqrt
-                    
-                    # x0_hatのNaN/Infチェック
-                    if torch.isnan(x0_hat).any():
-                        print(f"[ERROR] Step {i}: NaN detected in x0_hat computation!")
-                        print(f"[DEBUG] x_t stats: min={x_t.min().item():.6f}, max={x_t.max().item():.6f}")
-                        print(f"[DEBUG] eps stats: min={eps.min().item():.6f}, max={eps.max().item():.6f}")
-                        print(f"[DEBUG] sigma: {sigma}, alpha: {alpha.item():.6f}, alpha_sqrt: {alpha_sqrt.item():.6f}")
-                        print(f"[DEBUG] sigma_eps stats: min={sigma_eps.min().item():.6f}, max={sigma_eps.max().item():.6f}")
-                        print(f"[DEBUG] x_t_corrected stats: min={x_t_corrected.min().item():.6f}, max={x_t_corrected.max().item():.6f}")
-                        raise RuntimeError(f"NaN in x0_hat computation at step {i}")
-                    if torch.isinf(x0_hat).any():
-                        print(f"[ERROR] Step {i}: Inf detected in x0_hat computation!")
-                        print(f"[DEBUG] x0_hat stats: min={x0_hat.min().item():.6f}, max={x0_hat.max().item():.6f}")
-                        # Infを安全な値でクランプ
-                        x0_hat = torch.clamp(x0_hat, min=-100.0, max=100.0)
-                        print(f"[WARNING] Step {i}: Clamped Inf values in x0_hat")
+                    # x0_hat計算
+                    x0_hat = (x_t - sigma * eps) * alpha_sqrt
                     
                     print(f"[DEBUG] Step {i}: x0_hat dtype: {x0_hat.dtype}")
                     print(f"[DEBUG] Step {i}: x0_hat stats: min={x0_hat.min().item():.6f}, max={x0_hat.max().item():.6f}")
@@ -436,32 +403,9 @@ def sample_hunyuan(
                                 # ---- 1) latent チャンク抽出 ----
                                 print(f"[DEBUG] Step {i}: Extracting chunk to CPU to break parent tensor reference")
                                 
-                                # x0_hat_fp16のNaN/Infチェック（チャンク抽出前）
-                                chunk_source = x0_hat_fp16[:, :, start:end, :, :]
-                                if torch.isnan(chunk_source).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in chunk source before extraction!")
-                                    print(f"[DEBUG] chunk_source stats: min={chunk_source.min().item():.6f}, max={chunk_source.max().item():.6f}")
-                                    print(f"[DEBUG] x0_hat_fp16 full stats: min={x0_hat_fp16.min().item():.6f}, max={x0_hat_fp16.max().item():.6f}")
-                                    # NaN発生時はスキップまたは安全な値で代替
-                                    print(f"[WARNING] Step {i}: Skipping chunk {start}:{end} due to NaN in source")
-                                    continue  # このチャンクをスキップ
-                                
-                                if torch.isinf(chunk_source).any():
-                                    print(f"[ERROR] Step {i}: Inf detected in chunk source before extraction!")
-                                    print(f"[DEBUG] chunk_source stats: min={chunk_source.min().item():.6f}, max={chunk_source.max().item():.6f}")
-                                    # Infは安全な値でクランプ
-                                    chunk_source = torch.clamp(chunk_source, min=-50.0, max=50.0)
-                                    print(f"[WARNING] Step {i}: Clamped Inf values in chunk source")
-                                
-                                latent_chunk = chunk_source.clone().cpu()  # clone()でinference tensor回避
+                                latent_chunk = x0_hat_fp16[:, :, start:end, :, :].clone().cpu()
                                 print(f"[DEBUG] Step {i}: Moving chunk to {GPU_VAE} as independent copy")
                                 latent_chunk = latent_chunk.to(GPU_VAE, non_blocking=True)     # 独立コピー
-                                
-                                # GPU移動後の最終チェック
-                                if torch.isnan(latent_chunk).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in latent_chunk after GPU move!")
-                                    print(f"[WARNING] Step {i}: Skipping chunk {start}:{end} due to NaN after GPU move")
-                                    continue
                                 
                                 latent_chunk.requires_grad_(True)  # gradient path を作る
                                 print(f"[DEBUG] Step {i}: Chunk memory footprint: {latent_chunk.numel() * latent_chunk.element_size() / 1024**2:.1f} MB")
@@ -471,55 +415,12 @@ def sample_hunyuan(
                                 # ---- 2) forward (decode + heat-map) ----
                                 print(f"[DEBUG] Step {i}: Starting forward pass - VAE decode")
                                 with torch.set_grad_enabled(True):
-                                    # latent_chunkのNaN/Infチェック（VAE入力前）
-                                    if torch.isnan(latent_chunk).any():
-                                        print(f"[ERROR] Step {i}: NaN detected in latent_chunk before VAE decode!")
-                                        print(f"[DEBUG] latent_chunk stats: min={latent_chunk.min().item():.6f}, max={latent_chunk.max().item():.6f}")
-                                        raise RuntimeError(f"NaN in latent_chunk before VAE decode at step {i}")
-                                    if torch.isinf(latent_chunk).any():
-                                        print(f"[ERROR] Step {i}: Inf detected in latent_chunk before VAE decode!")
-                                        raise RuntimeError(f"Inf in latent_chunk before VAE decode at step {i}")
-                                    
-                                    # VAEデコード前の正規化値チェックと安全な処理
+                                    # VAEデコード前の正規化
                                     vae_scale = 0.18215
                                     normalized_latent = latent_chunk / vae_scale
                                     
-                                    # 正規化後の極値をクランプして安全性を確保
-                                    normalized_latent = torch.clamp(normalized_latent, min=-50.0, max=50.0)
-                                    
-                                    if torch.isnan(normalized_latent).any():
-                                        print(f"[ERROR] Step {i}: NaN detected after normalization (divide by {vae_scale})!")
-                                        raise RuntimeError(f"NaN after normalization at step {i}")
-                                    if torch.isinf(normalized_latent).any():
-                                        print(f"[ERROR] Step {i}: Inf detected after normalization!")
-                                        raise RuntimeError(f"Inf after normalization at step {i}")
-                                    
-                                    try:
-                                        img_chunk = vae_fp16.decode(normalized_latent).sample  # (B,3,Δt,H,W)
-                                    except Exception as vae_error:
-                                        print(f"[ERROR] Step {i}: VAE decode failed: {vae_error}")
-                                        print(f"[DEBUG] normalized_latent stats: min={normalized_latent.min().item():.6f}, max={normalized_latent.max().item():.6f}")
-                                        raise RuntimeError(f"VAE decode failed at step {i}: {vae_error}")
-                                    
-                                    # VAEデコード出力のNaN/Infチェック
-                                    if torch.isnan(img_chunk).any():
-                                        print(f"[ERROR] Step {i}: NaN detected in VAE decode output!")
-                                        print(f"[DEBUG] img_chunk stats: min={img_chunk.min().item():.6f}, max={img_chunk.max().item():.6f}")
-                                        raise RuntimeError(f"NaN in VAE decode output at step {i}")
-                                    if torch.isinf(img_chunk).any():
-                                        print(f"[ERROR] Step {i}: Inf detected in VAE decode output!")
-                                        raise RuntimeError(f"Inf in VAE decode output at step {i}")
-                                    
+                                    img_chunk = vae_fp16.decode(normalized_latent).sample  # (B,3,Δt,H,W)
                                     img_chunk = ((img_chunk + 1) / 2).to(x_t.dtype)             # 0-1 域へ
-                                    
-                                    # 0-1正規化後のNaN/Infチェック
-                                    if torch.isnan(img_chunk).any():
-                                        print(f"[ERROR] Step {i}: NaN detected after 0-1 normalization!")
-                                        print(f"[DEBUG] img_chunk stats: min={img_chunk.min().item():.6f}, max={img_chunk.max().item():.6f}")
-                                        raise RuntimeError(f"NaN after 0-1 normalization at step {i}")
-                                    if torch.isinf(img_chunk).any():
-                                        print(f"[ERROR] Step {i}: Inf detected after 0-1 normalization!")
-                                        raise RuntimeError(f"Inf after 0-1 normalization at step {i}")
                                     
                                     img_chunk = img_chunk.clone() # 画像のコピー（inference tensor回避）
                                     print(f"[DEBUG] Step {i}: VAE decode completed, img_chunk.shape = {img_chunk.shape}")
@@ -541,64 +442,12 @@ def sample_hunyuan(
                                         
                                         print(f"[DEBUG] Step {i}: Running auto_refine_model on frame")
                                         
-                                        try:
-                                            # フレームを安全な範囲にクランプ
-                                            safe_frame = torch.clamp(frame, min=0.0, max=1.0)
-                                            heatmap = auto_refine_model(safe_frame)      # (B,1,H,W)
-                                        except Exception as model_error:
-                                            print(f"[ERROR] Step {i}: auto_refine_model failed: {model_error}")
-                                            print(f"[DEBUG] frame stats: min={frame.min().item():.6f}, max={frame.max().item():.6f}")
-                                            raise RuntimeError(f"auto_refine_model failed at step {i}, frame {t_idx}: {model_error}")
-                                        
+                                        heatmap = auto_refine_model(frame)      # (B,1,H,W)
                                         print(f"[DEBUG] Step {i}: heatmap computed, shape = {heatmap.shape}")
                                         
-                                        # NaN/Inf チェック
-                                        if torch.isnan(heatmap).any():
-                                            print(f"[ERROR] Step {i}: NaN detected in heatmap!")
-                                            print(f"[DEBUG] heatmap stats: min={heatmap.min().item():.6f}, max={heatmap.max().item():.6f}, mean={heatmap.mean().item():.6f}")
-                                            print(f"[DEBUG] frame stats: min={frame.min().item():.6f}, max={frame.max().item():.6f}, mean={frame.mean().item():.6f}")
-                                            # NaN発生時は安全なゼロheatmapで代替
-                                            print(f"[WARNING] Step {i}: Replacing NaN heatmap with zeros")
-                                            heatmap = torch.zeros_like(heatmap)
-                                        if torch.isinf(heatmap).any():
-                                            print(f"[ERROR] Step {i}: Inf detected in heatmap!")
-                                            print(f"[DEBUG] heatmap stats: min={heatmap.min().item():.6f}, max={heatmap.max().item():.6f}")
-                                            # Inf発生時は安全なクランプで修正
-                                            print(f"[WARNING] Step {i}: Clamping Inf heatmap values")
-                                            heatmap = torch.clamp(heatmap, min=0.0, max=1.0)
-                                        
-                                        # heatmapの平均計算を安全に実行
                                         heatmap_mean = heatmap.mean()
-                                        if torch.isnan(heatmap_mean) or torch.isinf(heatmap_mean):
-                                            print(f"[WARNING] Step {i}: Invalid heatmap mean, using zero")
-                                            heatmap_mean = torch.zeros_like(heatmap_mean)
-                                        
-                                        heat_loss = (1 - heatmap_mean) * heatmap_guidance_strength
-                                        
-                                        # heat_loss の NaN/Inf チェック
-                                        if torch.isnan(heat_loss).any():
-                                            print(f"[ERROR] Step {i}: NaN detected in heat_loss!")
-                                            print(f"[DEBUG] heat_loss = {heat_loss.item():.6f}")
-                                            print(f"[DEBUG] heatmap_guidance_strength = {heatmap_guidance_strength}")
-                                            raise RuntimeError(f"NaN detected in heat_loss at step {i}, frame {t_idx}")
-                                        if torch.isinf(heat_loss).any():
-                                            print(f"[ERROR] Step {i}: Inf detected in heat_loss!")
-                                            print(f"[DEBUG] heat_loss = {heat_loss.item():.6f}")
-                                            raise RuntimeError(f"Inf detected in heat_loss at step {i}, frame {t_idx}")
-                                        
+                                        heat_loss = heatmap_mean * heatmap_guidance_strength
                                         loss = loss + heat_loss / chunk_frames  # チャンク内で平均
-                                        
-                                        # accumulated loss の NaN/Inf チェック
-                                        if torch.isnan(loss).any():
-                                            print(f"[ERROR] Step {i}: NaN detected in accumulated loss!")
-                                            print(f"[DEBUG] loss = {loss.item():.6f}")
-                                            print(f"[DEBUG] heat_loss = {heat_loss.item():.6f}")
-                                            print(f"[DEBUG] chunk_frames = {chunk_frames}")
-                                            raise RuntimeError(f"NaN detected in accumulated loss at step {i}, frame {t_idx}")
-                                        if torch.isinf(loss).any():
-                                            print(f"[ERROR] Step {i}: Inf detected in accumulated loss!")
-                                            print(f"[DEBUG] loss = {loss.item():.6f}")
-                                            raise RuntimeError(f"Inf detected in accumulated loss at step {i}, frame {t_idx}")
                                         
                                         print(f"[DEBUG] Step {i}: Frame {t_idx} processed, accumulated loss = {loss.item():.6f}")
                                 
@@ -644,18 +493,6 @@ def sample_hunyuan(
                             # ---- 1) latent 準備 ----
                             print(f"[DEBUG] Step {i}: Preparing single frame latent")
                             
-                            # x0_hat_fp16のNaN/Infチェック（single frame）
-                            if torch.isnan(x0_hat_fp16).any():
-                                print(f"[ERROR] Step {i}: NaN detected in x0_hat_fp16 (single frame)!")
-                                print(f"[DEBUG] x0_hat_fp16 stats: min={x0_hat_fp16.min().item():.6f}, max={x0_hat_fp16.max().item():.6f}")
-                                print(f"[WARNING] Step {i}: Skipping single frame processing due to NaN")
-                                return torch.zeros_like(x_t)  # 安全なゼロ勾配を返す
-                            
-                            if torch.isinf(x0_hat_fp16).any():
-                                print(f"[ERROR] Step {i}: Inf detected in x0_hat_fp16 (single frame)!")
-                                x0_hat_fp16 = torch.clamp(x0_hat_fp16, min=-50.0, max=50.0)
-                                print(f"[WARNING] Step {i}: Clamped Inf values in x0_hat_fp16 (single frame)")
-                            
                             latent = x0_hat_fp16.unsqueeze(2).clone().cpu()     # (B,16,1,H8,W8) → CPU, clone()追加
                             latent = latent.to(GPU_VAE, non_blocking=True)  # 独立コピー
                             latent.requires_grad_(True)
@@ -669,43 +506,10 @@ def sample_hunyuan(
                                 img = img.squeeze(2)                             # (B,3,H,W)
                                 img = img.clone()  # 画像のコピー（inference tensor回避）
                                 
-                                # ヒートマップ計算（安全な処理）
-                                try:
-                                    safe_img = torch.clamp(img, min=0.0, max=1.0)
-                                    heatmap = auto_refine_model(safe_img)
-                                except Exception as model_error:
-                                    print(f"[ERROR] Step {i}: auto_refine_model failed (single frame): {model_error}")
-                                    print(f"[DEBUG] img stats: min={img.min().item():.6f}, max={img.max().item():.6f}")
-                                    raise RuntimeError(f"auto_refine_model failed at step {i} (single frame): {model_error}")
-                                
-                                # NaN/Inf チェック (single frame case)
-                                if torch.isnan(heatmap).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in heatmap (single frame)!")
-                                    print(f"[DEBUG] heatmap stats: min={heatmap.min().item():.6f}, max={heatmap.max().item():.6f}")
-                                    print(f"[DEBUG] img stats: min={img.min().item():.6f}, max={img.max().item():.6f}")
-                                    print(f"[WARNING] Step {i}: Replacing NaN heatmap with zeros (single frame)")
-                                    heatmap = torch.zeros_like(heatmap)
-                                if torch.isinf(heatmap).any():
-                                    print(f"[ERROR] Step {i}: Inf detected in heatmap (single frame)!")
-                                    print(f"[WARNING] Step {i}: Clamping Inf heatmap values (single frame)")
-                                    heatmap = torch.clamp(heatmap, min=-10.0, max=10.0)
-                                
-                                # 安全なloss計算
+                                # ヒートマップ計算
+                                heatmap = auto_refine_model(img)
                                 heatmap_mean = heatmap.mean()
-                                if torch.isnan(heatmap_mean) or torch.isinf(heatmap_mean):
-                                    print(f"[WARNING] Step {i}: Invalid heatmap mean (single frame), using zero")
-                                    heatmap_mean = torch.zeros_like(heatmap_mean)
-                                
-                                loss = (1 - heatmap_mean) * heatmap_guidance_strength
-                                
-                                # loss の NaN/Inf チェック (single frame case)
-                                if torch.isnan(loss).any():
-                                    print(f"[ERROR] Step {i}: NaN detected in loss (single frame)!")
-                                    print(f"[DEBUG] loss = {loss.item():.6f}")
-                                    raise RuntimeError(f"NaN detected in loss at step {i} (single frame)")
-                                if torch.isinf(loss).any():
-                                    print(f"[ERROR] Step {i}: Inf detected in loss (single frame)!")
-                                    raise RuntimeError(f"Inf detected in loss at step {i} (single frame)")
+                                loss = heatmap_mean * heatmap_guidance_strength
                             
                             # ---- 3) backward ----
                             g, = torch.autograd.grad(loss, latent, retain_graph=False)
@@ -746,7 +550,7 @@ def sample_hunyuan(
                     del x0_hat
                 torch.cuda.empty_cache()
                 
-                return -grad_buf  # チャンクベース処理で蓄積された勾配を返す
+                return grad_buf
     
     # エッジ強化またはヒートマップガイダンスが有効な場合のみcond_fnを設定
     cond_fn = guidance_cond_fn if (heatmap_guidance_strength > 0.0) else None
